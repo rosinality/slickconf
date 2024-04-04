@@ -1,0 +1,20 @@
+[project]
+name = "slickconf"
+version = "0.1.0"
+description = "Configuration library for machine learning projects"
+requires-python = ">=3.7"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Kim Seonghyeon", email = "kim.seonghyeon@outlook.com"}
+]
+dependencies = [
+    "pydantic",
+]
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
