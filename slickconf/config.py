@@ -1,6 +1,7 @@
 import collections
 import functools
 import inspect
+import os
 import sys
 import typing
 from typing import Any, Callable, Optional
@@ -193,6 +194,20 @@ def resolve_module(path: str):
     return obj
 
 
+def resolve_module_pyfile(path: str, filepath):
+    import importlib
+
+    spec = importlib.util.spec_from_file_location(
+        os.path.splitext(os.path.basename(filepath))[0], filepath
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    function = getattr(module, path)
+
+    return function
+
+
 def flatten_tree(node):
     res = []
 
@@ -290,6 +305,7 @@ def _instance_traverse_validate(
         partial_key,
         args_key,
         key_key,
+        "__meta",
     }
 
     partial = node.get(partial_key, False)
@@ -310,7 +326,16 @@ def _instance_traverse_validate(
     else:
         target = node.get(target_key)
 
-    obj = resolve_module(target)
+    if node.get("__meta", None) is not None and node["__meta"].get(
+        "import_pyfile", False
+    ):
+        obj = resolve_module_pyfile(
+            node["__meta"]["qualname"], node["__meta"]["filepath"]
+        )
+
+    else:
+        obj = resolve_module(target)
+
     signature = inspect.signature(obj)
 
     rest = {}
@@ -425,6 +450,7 @@ def _instance_traverse_instantiate(
         partial_key,
         args_key,
         key_key,
+        "__meta",
     }
 
     return_fn = False
@@ -445,7 +471,16 @@ def _instance_traverse_instantiate(
     else:
         target = node.get(target_key)
 
-    obj = resolve_module(target)
+    if node.get("__meta", None) is not None and node["__meta"].get(
+        "import_pyfile", False
+    ):
+        obj = resolve_module_pyfile(
+            node["__meta"]["qualname"], node["__meta"]["filepath"]
+        )
+
+    else:
+        obj = resolve_module(target)
+
     signature = inspect.signature(obj)
 
     if key_key in node and node[key_key] in singleton_dict:

@@ -180,7 +180,7 @@ def load_arg_config(config_model, show: bool = False, parser=None):
 
     args = preset_parser.parse_args()
 
-    conf = load_config(config_model, args.conf, args.opts, show)
+    conf = load_config(args.conf, config_model, args.opts)
     conf.ckpt = args.ckpt
 
     if parser is None:

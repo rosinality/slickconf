@@ -1,10 +1,13 @@
 import ast
 import builtins
+import copy
 import functools
 import importlib
 import os
+import inspect
 import pydoc
 import textwrap
+import types
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
@@ -61,6 +64,10 @@ def import_to_str(obj: object):
 
 
 CALL_HANDLER_ID = "__auto_config_call_handler__"
+CLOSURE_WRAPPER_ID = "__auto_config_closure_wrapper__"
+EMPTY_ARGUMENTS = ast.arguments(
+    posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
+)
 
 
 def auto_config_call_handler(fn_or_cls: callable, *args, **kwargs):
@@ -69,6 +76,12 @@ def auto_config_call_handler(fn_or_cls: callable, *args, **kwargs):
         or fn_or_cls is finalize
         or fn_or_cls is tag
         or fn_or_cls is single
+        or fn_or_cls is function
+        or isinstance(fn_or_cls, EagerCallContainer)
+        or fn_or_cls is copy.copy
+        or fn_or_cls is copy.deepcopy
+        or inspect.isbuiltin(fn_or_cls)
+        or (inspect.isclass(fn_or_cls) and fn_or_cls.__module__ == "builtins")
     ):
         return fn_or_cls(*args, **kwargs)
 
@@ -85,6 +98,145 @@ class AutoConfigNodeTransformer(ast.NodeTransformer):
             args=[node.func, *(self.visit(arg) for arg in node.args)],
             keywords=[self.visit(keyword) for keyword in node.keywords],
         )
+
+
+def _wrap_ast_for_fn_with_closure_vars(
+    module: ast.Module,
+    fn: types.FunctionType,
+) -> ast.Module:
+    """Wraps `module.body` in a function that defines closure variables for `fn`.
+
+    If `fn` has any free variables (i.e., it's `__code__.co_freevars` is not
+    empty), we want to make sure that compiling its AST (assumed to be in the body
+    of `module`) will create the same set of free variables in the resulting code
+    object. However, by default this won't happen, since we would be compiling
+    `fn`'s AST in the absence of its original context (e.g., just compiling a
+    nested function, and not the containing one).
+
+    To work around this issue, this function wraps `module.body` in another
+    `FunctionDef` that defines dummy variables corresponding to `fn`'s free
+    variables. This causes the subsequent compile step to create the right set of
+    free variables, and allows us to use `fn.__closure__` when creating a
+    new function object via `types.FunctionType`.
+
+    We also add <_CALL_HANDLER_ID> as a final dummy variable, and append its value
+    (the call handler) to `fn.__closure__` when creating the new function object.
+
+    Effectively, this wrapping looks like the following Python code:
+
+        def __auto_config_closure_wrapper__():
+          closure_var_1 = None
+          closure_var_2 = None
+          ...
+          <_CALL_HANDLER_ID> = None
+
+          def fn(...):  # Or some expression involving a lambda.
+            ...  # Contains references to the closure variables.
+
+    Args:
+      module: An `ast.Module` object whose body contains the function definition
+        for `fn` (e.g., as an `ast.FunctionDef` or `ast.Lambda`).
+      fn: The function to create dummy closure variables for (assumed to
+        correspond to the body of `module`).
+
+    Returns:
+      A new `ast.Module` containing an additional wrapper `ast.FunctionDef` that
+      defines dummy closure variables.
+    """
+    ast_name = lambda name: ast.Name(id=name, ctx=ast.Store())
+    ast_none = ast.Constant(value=None)
+    closure_var_definitions = [
+        ast.Assign(targets=[ast_name(var_name)], value=ast_none)
+        for var_name in fn.__code__.co_freevars + (CALL_HANDLER_ID,)
+    ]
+
+    wrapper_module = ast.Module(
+        body=[
+            ast.FunctionDef(
+                name=CLOSURE_WRAPPER_ID,
+                args=EMPTY_ARGUMENTS,
+                body=[
+                    *closure_var_definitions,
+                    *module.body,
+                ],
+                decorator_list=[],
+            )
+        ],
+        type_ignores=[],
+    )
+    wrapper_module = ast.fix_missing_locations(wrapper_module)
+    return wrapper_module
+
+
+def _find_function_code(code: types.CodeType, fn_name: str):
+    """Finds the code object within `code` corresponding to `fn_name`."""
+    code = [
+        const
+        for const in code.co_consts
+        if inspect.iscode(const) and const.co_name == fn_name
+    ]
+    assert len(code) == 1, f"Couldn't find function code for {fn_name!r}."
+    return code[0]
+
+
+def _unwrap_code_for_fn(code: types.CodeType, fn: types.FunctionType):
+    """Unwraps `code` to find the code object for `fn`.
+
+    This function assumes `code` is the result of compiling an `ast.Module`
+    returned by `_wrap_node_for_fn_with_closure_vars`.
+
+    Args:
+      code: A code object containing code for `fn`.
+      fn: The function to find a code object for within `code`.
+
+    Returns:
+      The code object corresponding to `fn`.
+    """
+    code = _find_function_code(code, CLOSURE_WRAPPER_ID)
+    code = _find_function_code(code, fn.__name__)
+    return code
+
+
+def _make_closure_cell(contents):
+    """Returns `types.CellType(contents)`."""
+    if hasattr(types, "CellType"):
+        # `types.CellType` added in Python 3.8.
+        return types.CellType(contents)  # pytype: disable=wrong-arg-count
+    else:
+        # For earlier versions of Python, build a dummy function to get CellType.
+        dummy_fn = lambda: contents
+        cell_type = type(dummy_fn.__closure__[0])
+        return cell_type(contents)
+
+
+def config_fn(fn):
+    filename = inspect.getsourcefile(fn)
+    line_number = fn.__code__.co_firstlineno
+    source = textwrap.dedent(inspect.getsource(fn))
+    node = ast.parse(source)
+    node = AutoConfigNodeTransformer().visit(node)
+    node = ast.fix_missing_locations(node)
+    node = ast.increment_lineno(node, line_number - 1)
+    node = _wrap_ast_for_fn_with_closure_vars(node, fn)
+    code = compile(node, filename, "exec")
+    code = _unwrap_code_for_fn(code, fn)
+
+    indexed_handlers = []
+    closure = list(fn.__closure__ or ())
+    if CALL_HANDLER_ID in code.co_freevars:
+        handler_idx = code.co_freevars.index(CALL_HANDLER_ID)
+        handler = _make_closure_cell(auto_config_call_handler)
+        indexed_handlers.append((handler_idx, handler))
+
+    for handler_idx, handler in sorted(indexed_handlers):
+        closure.insert(handler_idx, handler)
+    closure = tuple(closure)
+
+    auto_config_fn = types.FunctionType(code, fn.__globals__, closure=closure)
+    auto_config_fn.__defaults__ = fn.__defaults__
+    auto_config_fn.__kwdefaults__ = fn.__kwdefaults__
+
+    return auto_config_fn
 
 
 def auto_config_from_source(source: str, filename: str):
@@ -117,13 +269,42 @@ def finalize(node, *args, **kwargs):
     return node
 
 
+class NodeDict(dict):
+    def __copy__(self):
+        new_dict = NodeDict()
+        for k, v in self.items():
+            if k == "__key":
+                obj, _ = v.rsplit("#", 1)
+                new_dict[k] = obj + f"#{single.counter}"
+                single.counter += 1
+
+            else:
+                new_dict[k] = copy.deepcopy(v)
+
+        return NodeDict(new_dict)
+
+    def __deepcopy__(self, memo):
+        new_dict = NodeDict()
+        memo[id(self)] = new_dict
+
+        for k, v in self.items():
+            if k == "__key":
+                obj, _ = v.rsplit("#", 1)
+                v = obj + f"#{Single.counter}"
+                Single.counter += 1
+
+            new_dict[copy.deepcopy(k, memo)] = copy.deepcopy(v, memo)
+
+        return NodeDict(new_dict)
+
+
 def build(__key, __name, *args, **kwargs):
     node = {__key: __name}
 
     if len(args) > 0:
         node["__args"] = list(args)
 
-    node = {**node, **kwargs}
+    node = NodeDict({**node, **kwargs})
 
     return node
 
@@ -144,26 +325,56 @@ def tag(tag_name, default=None):
     return build("__tag", tag_name, default=default)
 
 
+def function(obj, *args, **kwargs):
+    filepath = None
+    qualname = None
+
+    if not isinstance(obj, str):
+        filepath = obj.__code__.co_filename
+        qualname = obj.__qualname__
+        obj = import_to_str(obj)
+
+    res = build_fn(obj, *args, **kwargs)
+
+    if filepath is not None:
+        res["__meta"] = {
+            "filepath": filepath,
+            "qualname": qualname,
+            "import_pyfile": True,
+        }
+
+    return res
+
+
 class Init:
-    def __init__(self, name, fn=False, key=None):
+    def __init__(self, name, fn=False, key=None, filepath=None):
         self.name = name
         self.fn = fn
         self.key = key
+        self.filepath = filepath
 
     def __call__(self, *args, **kwargs):
         if self.fn:
-            return build_fn(self.name, *args, **kwargs)
+            res = build_fn(self.name, *args, **kwargs)
 
+            if self.filepath is not None:
+                res["_meta_"] = {"filepath": self.filepath}
+
+            return res
+        
         res = build_init(self.name, *args, **kwargs)
+
         if self.key is not None:
             res["__key"] = self.key
+
+        if self.filepath is not None:
+            res["_meta_"] = {"filepath": self.filepath}
 
         return res
 
 
 class Single:
-    def __init__(self):
-        self.counter = 0
+    counter = 0
 
     def __getitem__(self, obj):
         fn = False
@@ -171,16 +382,29 @@ class Single:
         if not isinstance(obj, str):
             obj = import_to_str(obj)
 
-        key = f"{obj}#{self.counter}"
-        self.counter += 1
+        key = f"{obj}#{Single.counter}"
+        Single.counter += 1
 
         return Init(obj, fn, key=key)
+
+
+class EagerCallContainer:
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
+
+
+class EagerCall:
+    def __getitem__(self, obj):
+        return EagerCallContainer(obj)
 
 
 class LazyCall:
     def __getitem__(self, obj):
         fn = False
-
+        
         if isinstance(obj, tuple):
             obj, fn = obj
 
@@ -280,6 +504,7 @@ class PyConfig:
         """
         has_keys = keys is not None
         filename = filename.replace("/./", "/")  # redundant
+        filename = os.path.abspath(filename)
 
         if os.path.splitext(filename)[1] not in [".py", ".yaml", ".yml"]:
             raise ValueError(f"Config file {filename} has to be a python or yaml file.")
@@ -386,3 +611,4 @@ L = LazyCall()
 F = LazyFn()
 field = Field
 single = Single()
+call = EagerCall()

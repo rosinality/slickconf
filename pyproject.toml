@@ -1,6 +1,6 @@
 [project]
 name = "slickconf"
-version = "0.1.0"
+version = "0.1.6"
 description = "Configuration library for machine learning projects"
 requires-python = ">=3.7"
 license = {file = "LICENSE"}
