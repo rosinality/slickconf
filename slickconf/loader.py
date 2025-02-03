@@ -16,7 +16,6 @@ except ImportError:
     _jsonnet = None
     ConfigFactory = None
 
-from fsspec.core import conf
 from pydantic import BaseModel
 
 from slickconf.config import Config
