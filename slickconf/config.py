@@ -1,10 +1,12 @@
 import collections
 import functools
 import inspect
-import os
+from inspect import _ParameterKind
+from copy import deepcopy
 import sys
 import typing
 from typing import Any, Callable, Optional
+from typing_extensions import Annotated
 
 from pydantic import (
     BaseModel,
@@ -14,6 +16,9 @@ from pydantic import (
     ValidationError,
     create_model,
     validator,
+    ConfigDict,
+    ValidatorFunctionWrapHandler,
+    field_validator,
 )
 
 try:
@@ -22,23 +27,55 @@ try:
 except ImportError:
     pass
 
+from slickconf.constants import (
+    EXCLUDE_KEYS,
+    TARGET_KEY,
+    INIT_KEY,
+    FN_KEY,
+    VALIDATE_KEY,
+    PARTIAL_KEY,
+    REPEAT_KEY,
+    ARGS_KEY,
+    KEY_KEY,
+    PLACEHOLDER_KEY,
+    META_KEY,
+    TAG_KEY,
+    ANNOTATE_KEY,
+)
+from slickconf.container import NodeDict
+from slickconf.pyconfig import resolve_module, resolve_module_pyfile
+
 CONFIG_REGISTRY = {}
 SINGLETON = {}
+
+
+class Tag(dict):
+    @classmethod
+    def __get_pydantic_core_schema__(self, cls, source_type):
+        return core_schema.no_info_after_validator_function(
+            cls.validate, core_schema.dict_schema()
+        )
+
+    @classmethod
+    def validate(cls, v):
+        if "__tag" not in v:
+            raise ValueError(f"value with type of field or tag is required; got {v}")
+
+        return cls(v)
+
+
+class TaggableModel(BaseModel):
+    def __init_subclass__(cls):
+        super().__init_subclass__()
+        annotations = getattr(cls, "__annotations__", {})
+        for attr_name, attr_type in annotations.items():
+            annotations[attr_name] = attr_type | Tag
 
 
 class Config(BaseModel):
     class Config:
         extra = "forbid"
         protected_namespaces = ()
-
-
-class StrictConfig:
-    extra = "forbid"
-    arbitrary_types_allowed = True
-
-
-class AnyConfig:
-    arbitrary_types_allowed = True
 
 
 class MainConfig(BaseModel):
@@ -64,6 +101,39 @@ def _check_type(type_name):
     return check_type
 
 
+@classmethod
+def instance_validator(cls, value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
+    try:
+        return handler(value)
+
+    except ValidationError as errors:
+        filtered_errors = []
+
+        for error in errors.errors():
+            input = error["input"]
+            is_instance = False
+            if not isinstance(input, str):
+                for exclude_key in EXCLUDE_KEYS:
+                    if exclude_key in input:
+                        is_instance = True
+
+                        break
+
+                if TAG_KEY in input:
+                    is_instance = True
+
+                    break
+
+            if not is_instance:
+                filtered_errors.append(error)
+
+        if len(filtered_errors) > 0:
+            raise ValidationError.from_exception_data(errors.title, filtered_errors)
+
+        else:
+            return value
+
+
 def make_model_from_signature(
     name: str,
     init_fn: Callable[..., Any],
@@ -83,7 +153,16 @@ def make_model_from_signature(
         if k in exclude:
             continue
 
-        if v.kind == v.VAR_POSITIONAL or v.kind == v.VAR_KEYWORD:
+        # pydantic do not want fields start with `_`
+        # so we skip keys starts with `_`
+        if k.startswith("_"):
+            continue
+
+        if (
+            v.kind == v.VAR_POSITIONAL
+            or v.kind == v.VAR_KEYWORD
+            or v.kind == v.POSITIONAL_ONLY
+        ):
             strict = False
 
             continue
@@ -116,16 +195,26 @@ def make_model_from_signature(
 
         return init_fn(*args, **params)
 
-    validators = {"params": _params, "make": _init_fn}
+    validators = {
+        "params": _params,
+        "make": _init_fn,
+    }
+
+    if len(params) > 0:
+        validators["instance_validator"] = field_validator(*params.keys(), mode="wrap")(
+            instance_validator
+        )
 
     if type_name is not None:
         validators["check_type"] = _check_type(type_name)
 
     if strict:
-        config = StrictConfig
+        config = ConfigDict(
+            extra="forbid", arbitrary_types_allowed=True, protected_namespaces=()
+        )
 
     else:
-        config = AnyConfig
+        config = ConfigDict(arbitrary_types_allowed=True, protected_namespaces=())
 
     model = create_model(
         name,
@@ -138,74 +227,6 @@ def make_model_from_signature(
     setattr(sys.modules[__name__], name, model)
 
     return model
-
-
-def resolve_module(path: str):
-    """
-    Resolves a module or attribute within a module from a dotted path.
-
-    This function attempts to import a module or attribute using a dotted path string. It starts by trying to import the
-    entire path as a module. If that fails, it progressively steps back through the path, attempting to import each
-    segment as a module until it finds a valid module. Then, it attempts to resolve any remaining path segments as
-    attributes within the found module.
-
-    Parameters:
-    - path (str): The dotted path string to resolve.
-
-    Returns:
-    - The resolved module or attribute.
-
-    Raises:
-    - ImportError: If the module or attribute cannot be found or imported.
-    """
-
-    from importlib import import_module
-
-    sub_path = path.split(".")
-    module = None
-
-    for i in reversed(range(len(sub_path))):
-        try:
-            mod = ".".join(sub_path[:i])
-            module = import_module(mod)
-
-        except (ModuleNotFoundError, ImportError):
-            continue
-
-        if module is not None:
-            break
-
-    obj = module
-
-    for sub in sub_path[i:]:
-        mod = f"{mod}.{sub}"
-
-        if not hasattr(obj, sub):
-            try:
-                import_module(mod)
-
-            except (ModuleNotFoundError, ImportError) as e:
-                raise ImportError(
-                    f"Encountered error: '{e}' when loading module '{path}'"
-                ) from e
-
-        obj = getattr(obj, sub)
-
-    return obj
-
-
-def resolve_module_pyfile(path: str, filepath):
-    import importlib
-
-    spec = importlib.util.spec_from_file_location(
-        os.path.splitext(os.path.basename(filepath))[0], filepath
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    function = getattr(module, path)
-
-    return function
 
 
 def flatten_tree(node):
@@ -227,23 +248,14 @@ def flatten_tree(node):
 
 
 def find_placeholder(node):
-    target_key = "__target"
-    init_key = "__init"
-    fn_key = "__fn"
-    validate_key = "__validate"
-    partial_key = "__partial"
-    args_key = "__args"
-    key_key = "__key"
-    placeholder_key = "__placeholder"
-
     exclude_keys = {
-        target_key,
-        init_key,
-        fn_key,
-        validate_key,
-        partial_key,
-        args_key,
-        key_key,
+        TARGET_KEY,
+        INIT_KEY,
+        FN_KEY,
+        VALIDATE_KEY,
+        PARTIAL_KEY,
+        ARGS_KEY,
+        KEY_KEY,
     }
 
     placeholders = set()
@@ -257,9 +269,9 @@ def find_placeholder(node):
         return placeholders
 
     if isinstance(node, collections.abc.Mapping):
-        if target_key in node or init_key in node or fn_key in node:
-            if args_key in node:
-                args_node = node[args_key]
+        if TARGET_KEY in node or INIT_KEY in node or FN_KEY in node:
+            if ARGS_KEY in node:
+                args_node = node[ARGS_KEY]
 
                 for arg in args_node:
                     placeholders = placeholders.union(find_placeholder(arg))
@@ -269,7 +281,7 @@ def find_placeholder(node):
                     continue
 
                 try:
-                    if v[placeholder_key] == placeholder_key:
+                    if v[PLACEHOLDER_KEY] == PLACEHOLDER_KEY:
                         placeholders.add(k)
 
                         continue
@@ -282,55 +294,74 @@ def find_placeholder(node):
     return placeholders
 
 
+def bind_arguments_from_node(node, parameters):
+    positional = []
+    keyword = {}
+    for key, val in node.items():
+        if key in EXCLUDE_KEYS:
+            continue
+
+        keyword[key] = val
+
+    arg_i = 0
+
+    var_positional = None
+    for i, param in enumerate(parameters.values()):
+        if param.kind == _ParameterKind.VAR_POSITIONAL:
+            var_positional = i
+
+            break
+
+    for i, param in enumerate(list(parameters.values())):
+        if param.kind == _ParameterKind.POSITIONAL_ONLY:
+            if arg_i < len(node[ARGS_KEY]):
+                positional.append(node[ARGS_KEY][arg_i])
+                arg_i += 1
+
+        elif param.kind == _ParameterKind.POSITIONAL_OR_KEYWORD:
+            if var_positional is not None and param.name in node:
+                positional.append(node[param.name])
+                del keyword[param.name]
+
+    if var_positional is not None:
+        for arg in node[ARGS_KEY][arg_i:]:
+            positional.append(arg)
+
+    if ARGS_KEY in keyword:
+        del keyword[ARGS_KEY]
+
+    return positional, keyword, var_positional
+
+
 def _instance_traverse_validate(
     node,
     recursive=True,
     instantiate=False,
     _tags_=None,
 ):
-    target_key = "__target"
-    init_key = "__init"
-    fn_key = "__fn"
-    validate_key = "__validate"
-    partial_key = "__partial"
-    args_key = "__args"
-    key_key = "__key"
-    tag_key = "__tag"
+    partial = node.get(PARTIAL_KEY, False)
+    do_validate = node.get(VALIDATE_KEY, True)
 
-    exclude_keys = {
-        target_key,
-        init_key,
-        fn_key,
-        validate_key,
-        partial_key,
-        args_key,
-        key_key,
-        "__meta",
-    }
+    if INIT_KEY in node:
+        target = node.get(INIT_KEY)
 
-    partial = node.get(partial_key, False)
-    do_validate = node.get(validate_key, True)
+    elif FN_KEY in node:
+        target = node.get(FN_KEY)
 
-    if init_key in node:
-        target = node.get(init_key)
-
-    elif fn_key in node:
-        target = node.get(fn_key)
-
-        if len([k for k in node if k not in exclude_keys]) > 0:
+        if len([k for k in node if k not in EXCLUDE_KEYS]) > 0:
             partial = True
 
         else:
             do_validate = False
 
     else:
-        target = node.get(target_key)
+        target = node.get(TARGET_KEY)
 
-    if node.get("__meta", None) is not None and node["__meta"].get(
+    if node.get(META_KEY, None) is not None and node[META_KEY].get(
         "import_pyfile", False
     ):
         obj = resolve_module_pyfile(
-            node["__meta"]["qualname"], node["__meta"]["filepath"]
+            node[META_KEY]["qualname"], node[META_KEY]["filepath"]
         )
 
     else:
@@ -340,15 +371,29 @@ def _instance_traverse_validate(
 
     rest = {}
 
+    positional, keyword, _ = bind_arguments_from_node(node, signature.parameters)
+
     args_replaced = []
-    if args_key in node:
-        for arg, k in zip(node[args_key], signature.parameters.keys()):
+    if len(positional) > 0:
+        for arg, (k, param) in zip(positional, signature.parameters.items()):
+            if isinstance(arg, collections.abc.Mapping) and ANNOTATE_KEY in arg:
+                arg = arg["value"]
+
+            if (
+                param.kind == _ParameterKind.POSITIONAL_ONLY
+                or param.kind == _ParameterKind.VAR_POSITIONAL
+            ):
+                continue
+
             rest[k] = arg
             args_replaced.append(k)
 
-    for k, v in node.items():
-        if k in exclude_keys:
-            continue
+    annotation_replaced = []
+
+    for k, v in keyword.items():
+        if isinstance(v, collections.abc.Mapping) and ANNOTATE_KEY in v:
+            annotation_replaced.append(k)
+            v = v["value"]
 
         rest[k] = instance_traverse(
             v, recursive=recursive, _tags_=_tags_, instantiate=instantiate
@@ -362,23 +407,11 @@ def _instance_traverse_validate(
 
         exclude = []
 
-        for r_k, r_v in rest.items():
-            for e_k in exclude_keys:
-                try:
-                    if not isinstance(r_v, str) and e_k in r_v:
-                        exclude.append(r_k)
-
-                        break
-
-                except:
-                    continue
-
-            try:
-                if not isinstance(r_v, str) and tag_key in r_v:
-                    exclude.append(r_k)
-
-            except:
-                pass
+        for r_k in rest.keys():
+            # pydantic do not want fields start with `_`
+            # so we skip keys starts with `_`
+            if r_k.startswith("_"):
+                exclude.append(r_k)
 
         if partial:
             rest_key = list(rest.keys())
@@ -419,6 +452,9 @@ def _instance_traverse_validate(
     for arg in args_replaced:
         del rest[arg]
 
+    for annotation in annotation_replaced:
+        del rest[annotation]
+
     return_dict = {**node, **rest}
 
     return return_dict
@@ -434,44 +470,25 @@ def _instance_traverse_instantiate(
     root=True,
     singleton_dict=None,
 ):
-    target_key = "__target"
-    init_key = "__init"
-    fn_key = "__fn"
-    validate_key = "__validate"
-    partial_key = "__partial"
-    args_key = "__args"
-    key_key = "__key"
-
-    exclude_keys = {
-        target_key,
-        init_key,
-        fn_key,
-        validate_key,
-        partial_key,
-        args_key,
-        key_key,
-        "__meta",
-    }
-
     return_fn = False
-    partial = node.get(partial_key, False)
+    partial = node.get(PARTIAL_KEY, False)
 
-    if init_key in node:
-        target = node.get(init_key)
+    if INIT_KEY in node:
+        target = node.get(INIT_KEY)
 
-    elif fn_key in node:
-        target = node.get(fn_key)
+    elif FN_KEY in node:
+        target = node.get(FN_KEY)
 
-        if len([k for k in node if k not in exclude_keys]) > 0:
+        if len([k for k in node if k not in EXCLUDE_KEYS]) > 0:
             partial = True
 
         else:
             return_fn = True
 
     else:
-        target = node.get(target_key)
+        target = node.get(TARGET_KEY)
 
-    if node.get("__meta", None) is not None and node["__meta"].get(
+    if node.get(META_KEY, None) is not None and node[META_KEY].get(
         "import_pyfile", False
     ):
         obj = resolve_module_pyfile(
@@ -483,16 +500,18 @@ def _instance_traverse_instantiate(
 
     signature = inspect.signature(obj)
 
-    if key_key in node and node[key_key] in singleton_dict:
-        return singleton_dict[node[key_key]]
+    if KEY_KEY in node and node[KEY_KEY] in singleton_dict:
+        return singleton_dict[node[KEY_KEY]]
 
-    if args_key in node:
-        args_node = node[args_key]
+    positional, keyword, var_positional_id = bind_arguments_from_node(
+        node, signature.parameters
+    )
 
-        if len(args_node) > len(args):
+    if len(positional) > 0:
+        if len(positional) > len(args):
             args_init = []
 
-            for a in args_node[len(args) :]:
+            for a in positional[len(args) :]:
                 args_init.append(
                     instance_traverse(
                         a,
@@ -507,7 +526,11 @@ def _instance_traverse_instantiate(
 
             args = list(args) + args_init
 
-    pos_replace = list(signature.parameters.keys())[: len(args)]
+    len_replaced = len(args)
+    if var_positional_id is not None:
+        len_replaced = min(len_replaced, var_positional_id + 1)
+
+    pos_replace = list(signature.parameters.keys())[:len_replaced]
 
     kwargs = {}
 
@@ -515,10 +538,7 @@ def _instance_traverse_instantiate(
         for k, v in keyword_args.items():
             kwargs[k] = v
 
-    for k, v in node.items():
-        if k in exclude_keys:
-            continue
-
+    for k, v in keyword.items():
         if k in pos_replace:
             continue
 
@@ -546,8 +566,8 @@ def _instance_traverse_instantiate(
     else:
         instance = obj(*args, **kwargs)
 
-    if key_key in node and node[key_key] not in SINGLETON:
-        singleton_dict[node[key_key]] = instance
+    if KEY_KEY in node and node[KEY_KEY] not in SINGLETON:
+        singleton_dict[node[KEY_KEY]] = instance
 
     return instance
 
@@ -562,12 +582,7 @@ def _instance_traverse_dict(
     root=True,
     singleton_dict=None,
 ):
-    target_key = "__target"
-    init_key = "__init"
-    fn_key = "__fn"
-    tag_key = "__tag"
-
-    if target_key in node or init_key in node or fn_key in node:
+    if TARGET_KEY in node or INIT_KEY in node or FN_KEY in node:
         if instantiate:
             return _instance_traverse_instantiate(
                 node,
@@ -583,14 +598,42 @@ def _instance_traverse_dict(
         else:
             return _instance_traverse_validate(node, recursive=recursive, _tags_=_tags_)
 
-    elif tag_key in node:
-        tag = node[tag_key]
+    elif REPEAT_KEY in node:
+        node_dict = NodeDict._recursive_init_(node[REPEAT_KEY])
+        nodes = [deepcopy(node_dict) for _ in range(node["times"])]
+
+        return instance_traverse(
+            nodes,
+            recursive=recursive,
+            instantiate=instantiate,
+            keyword_args=keyword_args,
+            _tags_=_tags_,
+            root=False,
+            singleton_dict=singleton_dict,
+        )
+
+    elif TAG_KEY in node:
+        tag = node[TAG_KEY]
 
         if _tags_ is not None and tag in _tags_:
             return _tags_[tag]
 
+        elif "default" in node:
+            return instance_traverse(
+                node["default"],
+                recursive=recursive,
+                instantiate=instantiate,
+                keyword_args=keyword_args,
+                _tags_=_tags_,
+                root=False,
+                singleton_dict=singleton_dict,
+            )
+
         else:
             raise ValueError(f"Tag '{tag}' not found in _tags_")
+
+    elif instantiate and ANNOTATE_KEY in node:
+        return node["value"]
 
     else:
         mapping = {}
@@ -668,7 +711,7 @@ def init_singleton(nodes):
         SINGLETON[node_key] = instance_traverse(restrict_node, instantiate=True)
 
 
-class Instance(dict):
+class Instance(NodeDict):
     @classmethod
     def __get_pydantic_core_schema__(self, cls, source_type):
         return core_schema.no_info_after_validator_function(
@@ -721,22 +764,20 @@ def instantiate(instance, *args, _tags_: dict[str, Any] = None, **kwargs):
     - The instantiated or traversed instance.
     """
 
-    try:
+    if hasattr(instance, "make"):
         return instance.make(
             *args,
             _tags_=_tags_,
             **kwargs,
         )
 
-    except AttributeError:
-        # init_singleton(flatten_tree(instance))
-        singleton_dict = {}
+    singleton_dict = {}
 
-        return instance_traverse(
-            instance,
-            *args,
-            instantiate=True,
-            keyword_args=kwargs,
-            _tags_=_tags_,
-            singleton_dict=singleton_dict,
-        )
+    return instance_traverse(
+        instance,
+        *args,
+        instantiate=True,
+        keyword_args=kwargs,
+        _tags_=_tags_,
+        singleton_dict=singleton_dict,
+    )
