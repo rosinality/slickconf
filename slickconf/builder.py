@@ -5,27 +5,26 @@ import functools
 import importlib
 import os
 import inspect
-import pydoc
+import linecache
 import textwrap
 import types
 import uuid
-from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from typing import Tuple, Union
 
-from slickconf.config import resolve_module
+import libcst as cst
+
+from slickconf.constants import (
+    INIT_KEY,
+    FN_KEY,
+    ARGS_KEY,
+    REPEAT_KEY,
+)
+from slickconf.container import Field, NodeDict, SingleCounter
+from slickconf.pyconfig import import_to_str
 
 CFG_PACKAGE_NAME = "slickconf._conf_loader"
-
-
-def str_to_import(name: str):
-    obj = pydoc.locate(name)
-
-    if obj is None:
-        obj = resolve_module(name)
-
-    return obj
 
 
 def validate_syntax(filename: str):
@@ -44,44 +43,42 @@ def random_package_name(filename: str):
     return CFG_PACKAGE_NAME + str(uuid.uuid4())[:4] + "." + os.path.basename(filename)
 
 
-def import_to_str(obj: object):
-    module, qualname = obj.__module__, obj.__qualname__
-
-    module_parts = module.split(".")
-
-    for i in range(1, len(module_parts)):
-        prefix = ".".join(module_parts[:i])
-        candid = f"{prefix}.{qualname}"
-
-        try:
-            if str_to_import(candid) is obj:
-                return candid
-
-        except ImportError:
-            pass
-
-    return f"{module}.{qualname}"
-
-
 CALL_HANDLER_ID = "__auto_config_call_handler__"
 CLOSURE_WRAPPER_ID = "__auto_config_closure_wrapper__"
+EXEMPT_DECORATOR_ID = "__auto_config_exempt_decorator__"
 EMPTY_ARGUMENTS = ast.arguments(
     posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
 )
 
 
+def exempt(fn_or_cls: callable):
+    fn_or_cls.__exempt__ = True
+
+    return fn_or_cls
+
+
+def get_instance_attr(instance, attr):
+    return getattr(instance, attr)
+
+
 def auto_config_call_handler(fn_or_cls: callable, *args, **kwargs):
     if (
-        fn_or_cls is field
-        or fn_or_cls is finalize
-        or fn_or_cls is tag
-        or fn_or_cls is single
-        or fn_or_cls is function
+        fn_or_cls
+        in {
+            Field,
+            finalize,
+            tag,
+            single,
+            function,
+            annotate,
+            copy.copy,
+            copy.deepcopy,
+            repeat,
+        }
         or isinstance(fn_or_cls, EagerCallContainer)
-        or fn_or_cls is copy.copy
-        or fn_or_cls is copy.deepcopy
         or inspect.isbuiltin(fn_or_cls)
         or (inspect.isclass(fn_or_cls) and fn_or_cls.__module__ == "builtins")
+        or getattr(fn_or_cls, "__exempt__", False)
     ):
         return fn_or_cls(*args, **kwargs)
 
@@ -91,13 +88,30 @@ def auto_config_call_handler(fn_or_cls: callable, *args, **kwargs):
     return single[fn_or_cls](*args, **kwargs)
 
 
+def auto_config_exempt_decorator(fn):
+    fn.__exempt__ = True
+
+    return fn
+
+
 class AutoConfigNodeTransformer(ast.NodeTransformer):
+    def __init__(self, apply_exempt_decorator: bool = False):
+        self.apply_exempt_decorator = apply_exempt_decorator
+
     def visit_Call(self, node):
         return ast.Call(
             func=ast.Name(id=CALL_HANDLER_ID, ctx=ast.Load()),
             args=[node.func, *(self.visit(arg) for arg in node.args)],
             keywords=[self.visit(keyword) for keyword in node.keywords],
         )
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        if self.apply_exempt_decorator:
+            node.decorator_list.append(ast.Name(id=EXEMPT_DECORATOR_ID, ctx=ast.Load()))
+
+        node = self.generic_visit(node)
+
+        return node
 
 
 def _wrap_ast_for_fn_with_closure_vars(
@@ -209,10 +223,67 @@ def _make_closure_cell(contents):
         return cell_type(contents)
 
 
+def _is_lambda(fn):
+    if not inspect.isfunction(fn):
+        return False
+
+    if not (hasattr(fn, "__name__") and hasattr(fn, "__code__")):
+        return False
+
+    return (fn.__name__ == "<lambda>") or (fn.__code__.co_name == "<lambda>")
+
+
+class _LambdaFinder(cst.CSTVisitor):
+    METADATA_DEPENDENCIES = (cst.metadata.PositionProvider,)
+
+    def __init__(self, lambda_fn):
+        super().__init__()
+
+        self.lambda_fn = lambda_fn
+        self.lineno = lambda_fn.__code__.co_firstlineno
+        self.candidates = []
+
+    def visit_Lambda(self, node):
+        loc = self.get_metadata(cst.metadata.PositionProvider, node)
+
+        if loc.start.line == self.lineno:
+            self.candidates.append(node)
+
+
+def _getsource_for_lambda(fn):
+    module = inspect.getmodule(fn)
+    filename = inspect.getsourcefile(fn)
+    lines = linecache.getlines(filename, module.__dict__)
+    source = "".join(lines)
+
+    module_cst = cst.parse_module(source)
+    lambda_finder = _LambdaFinder(fn)
+    cst.metadata.MetadataWrapper(module_cst).visit(lambda_finder)
+
+    if len(lambda_finder.candidates) == 1:
+        lambda_node = lambda_finder.candidates[0]
+
+        return cst.Module(body=[lambda_node]).code
+
+    elif not lambda_finder.candidates:
+        raise ValueError(f"Cannot find source for {fn} on line {lambda_finder.lineno}")
+
+    else:
+        raise ValueError(
+            "Cannot find source for {fn} on line {lambda_finder.lineno}; multiple lambdas found"
+        )
+
+
 def config_fn(fn):
     filename = inspect.getsourcefile(fn)
     line_number = fn.__code__.co_firstlineno
-    source = textwrap.dedent(inspect.getsource(fn))
+
+    if _is_lambda(fn):
+        source = _getsource_for_lambda(fn)
+
+    else:
+        source = textwrap.dedent(inspect.getsource(fn))
+
     node = ast.parse(source)
     node = AutoConfigNodeTransformer().visit(node)
     node = ast.fix_missing_locations(node)
@@ -235,6 +306,7 @@ def config_fn(fn):
     auto_config_fn = types.FunctionType(code, fn.__globals__, closure=closure)
     auto_config_fn.__defaults__ = fn.__defaults__
     auto_config_fn.__kwdefaults__ = fn.__kwdefaults__
+    auto_config_fn.__exempt__ = True
 
     return auto_config_fn
 
@@ -242,7 +314,7 @@ def config_fn(fn):
 def auto_config_from_source(source: str, filename: str):
     source = textwrap.dedent(source)
     node = ast.parse(source)
-    node = AutoConfigNodeTransformer().visit(node)
+    node = AutoConfigNodeTransformer(apply_exempt_decorator=True).visit(node)
     node = ast.fix_missing_locations(node)
     code = compile(node, filename, "exec")
 
@@ -253,88 +325,73 @@ def finalize(node, *args, **kwargs):
     node = deepcopy(node)
 
     if "__fn" in node:
-        name = node["__fn"]
-        del node["__fn"]
-        node["__init"] = name
+        name = node[FN_KEY]
+        del node[FN_KEY]
+        node[INIT_KEY] = name
 
     if len(args) > 0:
-        if "__args" in node:
-            node["__args"] += list(args)
+        if ARGS_KEY in node:
+            node[ARGS_KEY] += list(args)
 
         else:
-            node["__args"] = list(args)
+            node[ARGS_KEY] = list(args)
 
     node = {**node, **kwargs}
 
     return node
 
 
-class NodeDict(dict):
-    def __copy__(self):
-        new_dict = NodeDict()
-        for k, v in self.items():
-            if k == "__key":
-                obj, _ = v.rsplit("#", 1)
-                new_dict[k] = obj + f"#{single.counter}"
-                single.counter += 1
-
-            else:
-                new_dict[k] = copy.deepcopy(v)
-
-        return NodeDict(new_dict)
-
-    def __deepcopy__(self, memo):
-        new_dict = NodeDict()
-        memo[id(self)] = new_dict
-
-        for k, v in self.items():
-            if k == "__key":
-                obj, _ = v.rsplit("#", 1)
-                v = obj + f"#{Single.counter}"
-                Single.counter += 1
-
-            new_dict[copy.deepcopy(k, memo)] = copy.deepcopy(v, memo)
-
-        return NodeDict(new_dict)
+def build_init(__name, __obj, *args, **kwargs):
+    return NodeDict.build(INIT_KEY, __name, __obj, args, kwargs)
 
 
-def build(__key, __name, *args, **kwargs):
-    node = {__key: __name}
-
-    if len(args) > 0:
-        node["__args"] = list(args)
-
-    node = NodeDict({**node, **kwargs})
-
-    return node
-
-
-def build_init(__name, *args, **kwargs):
-    return build("__init", __name, *args, **kwargs)
-
-
-def build_fn(__name, *args, **kwargs):
-    return build("__fn", __name, *args, **kwargs)
+def build_fn(__name, __obj, *args, **kwargs):
+    return NodeDict.build(FN_KEY, __name, __obj, args, kwargs)
 
 
 def placeholder(default=None):
-    return build("__placeholder", "__placeholder", default=default)
+    return Field({"__placeholder": "__placeholder", "default": default})
 
 
-def tag(tag_name, default=None):
-    return build("__tag", tag_name, default=default)
+def annotate(annotation, value):
+    return Field({"__annotate": annotation, "value": value})
+
+
+def repeat(node, times):
+    return Field({REPEAT_KEY: node, "times": times})
+
+
+class NoValue:
+    def __repr__(self):
+        return "slickconf.NO_VALUE"
+
+
+NO_VALUE = NoValue()
+
+
+def tag(tag_name, default=NO_VALUE):
+    if isinstance(default, NoValue):
+        return Field({"__tag": tag_name})
+
+    return Field({"__tag": tag_name, "default": default})
 
 
 def function(obj, *args, **kwargs):
     filepath = None
     qualname = None
 
+    name = obj
     if not isinstance(obj, str):
         filepath = obj.__code__.co_filename
         qualname = obj.__qualname__
-        obj = import_to_str(obj)
+        name = import_to_str(obj)
 
-    res = build_fn(obj, *args, **kwargs)
+    if CLOSURE_WRAPPER_ID in name:
+        prefix = f"{CLOSURE_WRAPPER_ID}.<locals>."
+        name = name.replace(prefix, "")
+        qualname = qualname.replace(prefix, "")
+
+    res = build_fn(name, obj, *args, **kwargs)
 
     if filepath is not None:
         res["__meta"] = {
@@ -347,7 +404,8 @@ def function(obj, *args, **kwargs):
 
 
 class Init:
-    def __init__(self, name, fn=False, key=None, filepath=None):
+    def __init__(self, obj, name, fn=False, key=None, filepath=None):
+        self.obj = obj
         self.name = name
         self.fn = fn
         self.key = key
@@ -355,14 +413,14 @@ class Init:
 
     def __call__(self, *args, **kwargs):
         if self.fn:
-            res = build_fn(self.name, *args, **kwargs)
+            res = build_fn(self.name, self.obj, *args, **kwargs)
 
             if self.filepath is not None:
                 res["_meta_"] = {"filepath": self.filepath}
 
             return res
-        
-        res = build_init(self.name, *args, **kwargs)
+
+        res = build_init(self.name, self.obj, *args, **kwargs)
 
         if self.key is not None:
             res["__key"] = self.key
@@ -374,18 +432,17 @@ class Init:
 
 
 class Single:
-    counter = 0
-
     def __getitem__(self, obj):
         fn = False
 
+        name = obj
         if not isinstance(obj, str):
-            obj = import_to_str(obj)
+            name = import_to_str(obj)
 
-        key = f"{obj}#{Single.counter}"
-        Single.counter += 1
+        key = f"{name}#{SingleCounter.counter}"
+        SingleCounter.increase()
 
-        return Init(obj, fn, key=key)
+        return Init(obj, name, fn, key=key)
 
 
 class EagerCallContainer:
@@ -404,22 +461,24 @@ class EagerCall:
 class LazyCall:
     def __getitem__(self, obj):
         fn = False
-        
+
         if isinstance(obj, tuple):
             obj, fn = obj
 
+        name = obj
         if not isinstance(obj, str):
-            obj = import_to_str(obj)
+            name = import_to_str(obj)
 
-        return Init(obj, fn)
+        return Init(obj, name, fn)
 
 
 class LazyFn:
     def __getitem__(self, obj):
+        name = obj
         if not isinstance(obj, str):
-            obj = import_to_str(obj)
+            name = import_to_str(obj)
 
-        return Init(obj, True)
+        return Init(obj, name, True)
 
 
 @contextmanager
@@ -477,7 +536,10 @@ def patch_import():
             with open(cur_file) as f:
                 content = f.read()
 
-            exec(compile(content, cur_file, "exec"), module.__dict__)
+            # exec(compile(content, cur_file, "exec"), module.__dict__)
+            module.__dict__[CALL_HANDLER_ID] = auto_config_call_handler
+            module.__dict__[EXEMPT_DECORATOR_ID] = auto_config_exempt_decorator
+            exec(auto_config_from_source(content, cur_file), module.__dict__)
 
             # for name in fromlist:  # turn imported dict into DictConfig automatically
             #     val = _cast_to_config(module.__dict__[name])
@@ -494,7 +556,11 @@ def patch_import():
 
 class PyConfig:
     @staticmethod
-    def load(filename: str, keys: Union[None, str, Tuple[str, ...]] = None):
+    def load(
+        filename: str,
+        keys: Union[None, str, Tuple[str, ...]] = None,
+        config_name="conf",
+    ):
         """
         Load a config file.
         Args:
@@ -529,12 +595,18 @@ class PyConfig:
 
                 else:
                     module_namespace[CALL_HANDLER_ID] = auto_config_call_handler
+                    module_namespace[EXEMPT_DECORATOR_ID] = auto_config_exempt_decorator
 
                     exec(auto_config_from_source(content, filename), module_namespace)
 
             ret = module_namespace
 
-        ret = ret["conf"].to_dict()
+        ret = ret[config_name]
+
+        if callable(ret):
+            ret = ret()
+
+        ret = ret.to_dict()
 
         if has_keys:
             return tuple(ret[a] for a in keys)
@@ -542,73 +614,7 @@ class PyConfig:
         return ret
 
 
-def unfold_field(x):
-    if isinstance(x, Sequence) and not isinstance(x, str):
-        return [unfold_field(i) for i in x]
-
-    if isinstance(x, Mapping):
-        res = {}
-
-        for k, v in x.items():
-            res[k] = unfold_field(v)
-
-        return res
-
-    return x
-
-
-class Field(dict):
-    def __init__(self, *args, **kwargs):
-        self.update(*args, **kwargs)
-
-    def __getattr__(self, key):
-        try:
-            return object.__getattribute__(self, key)
-
-        except AttributeError:
-            try:
-                return self[key]
-
-            except KeyError:
-                raise AttributeError(key)
-
-    def __setattr__(self, key, value):
-        try:
-            object.__getattribute__(self, key)
-
-        except AttributeError:
-            try:
-                self[key] = value
-
-            except:
-                raise AttributeError(key)
-
-        else:
-            object.__setattr__(self, key, value)
-
-    def __delattr__(self, key):
-        try:
-            object.__getattribute__(self, key)
-
-        except AttributeError:
-            try:
-                del self[key]
-
-            except KeyError:
-                raise AttributeError(key)
-
-        else:
-            object.__delattr__(self, key)
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}({dict.__repr__(self)})"
-
-    def to_dict(self):
-        return unfold_field(self)
-
-
 L = LazyCall()
 F = LazyFn()
-field = Field
 single = Single()
 call = EagerCall()
