@@ -1,6 +1,6 @@
 [project]
 name = "slickconf"
-version = "0.1.6"
+version = "0.1.12"
 description = "Configuration library for machine learning projects"
 requires-python = ">=3.7"
 license = {file = "LICENSE"}
@@ -9,6 +9,7 @@ authors = [
 ]
 dependencies = [
     "pydantic",
+    "libcst",
 ]
 
 [tool.isort]
