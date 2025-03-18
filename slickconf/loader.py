@@ -21,11 +21,8 @@ from pydantic import BaseModel
 from slickconf.config import Config
 from slickconf.container import Field, NodeDict, SingleCounter
 from slickconf.constants import KEY_KEY
-from slickconf.tree import traverse
-
-
-import ast
-import re
+from slickconf.evaluate import evaluate
+from slickconf.tree import traverse, tree_map
 
 
 def parse_expr(expr):
@@ -33,7 +30,7 @@ def parse_expr(expr):
     left = left.strip()
 
     try:
-        right = ast.literal_eval(right)
+        right = evaluate(right)
 
     except (SyntaxError, ValueError) as _:
         pass
