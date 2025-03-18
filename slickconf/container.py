@@ -1,11 +1,11 @@
 from collections.abc import Mapping, Sequence
+from collections import namedtuple
 import copy
 import functools
 import inspect
 from inspect import _ParameterKind
+import operator
 from typing import Any
-
-from torch import normal
 
 try:
     from pydantic_core import core_schema
@@ -57,6 +57,309 @@ def unfold_field(x):
         return res
 
     return x
+
+
+# from ml_collections
+# https://github.com/google/ml_collections/blob/master/ml_collections/config_dict/config_dict.py
+
+_NoneType = type(None)
+
+
+def _is_callable_type(field_type):
+    """Tries to ensure: `_is_callable_type(type(obj)) == callable(obj)`."""
+    return any("__call__" in c.__dict__ for c in field_type.__mro__)
+
+
+def _is_type_safety_violation(value, field_type):
+    """Helper function for type safety exceptions.
+
+    This function determines whether or not assigning a value to a field violates
+    type safety.
+
+    Args:
+      value: The value to be assigned.
+      field_type: Type of the field that we would like to assign value to.
+
+    Returns:
+      True if assigning value to field violates type safety, False otherwise.
+    """
+    # Allow None to override and be overridden by any type.
+    if value is None or field_type == _NoneType:
+        return False
+    elif isinstance(value, field_type):
+        return False
+    else:
+        # A callable can overridde a callable.
+        return not (callable(value) and _is_callable_type(field_type))
+
+
+def _safe_cast(value, field_type, type_safe=False):
+    """Helper function to handle the exceptional type conversions.
+
+    This function implements the following exceptions for type-checking rules:
+
+    * An `int` will be converted to a `float` if overriding a `float` field.
+    * Any string value can override a `str` or `unicode` field. The value is
+    converted to `field_type`.
+    * A `tuple` will be converted to a `list` if overriding a `list` field.
+    * A `list` will be converted to a `tuple` if overriding `tuple` field.
+    * Short and long integers are indistinguishable. The final value will always
+    be a `long` if both types are present.
+
+    Args:
+      value: The value to be assigned.
+      field_type: The type for the field that we would like to assign value to.
+      type_safe: If True, the method will throw an error if the `value` is not of
+          type `field_type` after safe type conversions.
+
+    Returns:
+      The converted type-safe version of the value if it is one of the cases
+      described. Otherwise, return the value without conversion.
+
+    Raises:
+      TypeError: if types don't match  after safe type conversions.
+    """
+    original_value_type = type(value)
+
+    # The int->float exception.
+    if isinstance(value, int) and field_type is float:
+        return float(value)
+
+    # The unicode/string to string exception.
+    if isinstance(value, str) and field_type is str:
+        return field_type(value)
+
+    # tuple<->list conversion. JSON serialization converts lists to tuples, so
+    # we need this to avoid errors when overriding a list field with its
+    # deserialized version. See b/34805906 for more details.
+    if isinstance(value, tuple) and field_type is list:
+        return list(value)
+    if isinstance(value, list) and field_type is tuple:
+        return tuple(value)
+
+    if isinstance(value, int) and field_type is int:
+        return value
+
+    if type_safe and _is_type_safety_violation(value, field_type):
+        raise TypeError(
+            "{} is of original type {} and cannot be casted to type {}".format(
+                value, str(original_value_type), str(field_type)
+            )
+        )
+    return value
+
+
+class _Op(namedtuple("_Op", ["fn", "args"])):
+    """A named tuple representing a lazily computed op.
+
+    The _Op named tuple has two fields:
+      fn: The function to be applied.
+      args: a tuple/list of arguments that are used with the op.
+    """
+
+
+def _get_computed_value(value_or_fieldreference):
+    if isinstance(value_or_fieldreference, FieldReference):
+        return value_or_fieldreference.get()
+    return value_or_fieldreference
+
+
+class FieldReference:
+    def __init__(
+        self,
+        default: Any,
+        field_type: Any | None = None,
+        op: Any | None = None,
+        required: bool = False,
+    ):
+        self._value = None
+
+        if field_type is None:
+            if default is None:
+                raise ValueError("default value cannot be None if field_type is None")
+
+            elif isinstance(default, FieldReference):
+                field_type = default.get_type()
+
+            else:
+                field_type = type(default)
+
+        else:
+            try:
+                isinstance(None, field_type)
+
+            except TypeError:
+                raise TypeError(f"field_type should be a type, not {type(field_type)}")
+
+        self._field_type = field_type
+        self.set(default)
+
+        if required and op is not None:
+            raise ValueError("cannot set required to True if op is not None")
+
+        self._required = required
+        self._ops = [] if op is None else [op]
+
+    __hash__ = None
+
+    def has_cycle(self, visited=None):
+        visited = visited or set()
+
+        if id(self) in visited:
+            return True
+
+        visited.add(id(self))
+
+        value = self._value
+        if isinstance(value, FieldReference) and value.has_cycle(visited.copy()):
+            return True
+
+        for op in self._ops:
+            for arg in op.args:
+                if isinstance(arg, FieldReference) and arg.has_cycle(visited.copy()):
+                    return True
+
+        return False
+
+    def set(self, value, type_safe=True):
+        self._ops = []
+
+        if value is None:
+            self._value = None
+
+        elif isinstance(value, FieldReference):
+            if type_safe and not issubclass(value.get_type(), self.get_type()):
+                raise TypeError(
+                    f"reference is of type {value.get_type()}, expected {self.get_type()}"
+                )
+
+            old_value = getattr(self, "_value", None)
+            self._value = value
+
+            if self.has_cycle():
+                self._value = old_value
+
+                raise RuntimeError("cycle detected")
+
+        else:
+            self._value = _safe_cast(value, self._field_type, type_safe)
+
+    def get_type(self):
+        return self._field_type
+
+    def __getattr__(self, name: str):
+        return self._apply_op(operator.attrgetter(name), new_type=object)
+
+    def __call__(self, *args, **kwargs):
+        n_args = len(args)
+        kwargs_keys = list(kwargs.keys())
+
+        def flow_fn(value, *flat_args):
+            final_args = flat_args[:n_args]
+            final_kwargs = dict(zip(kwargs_keys, flat_args[n_args:]))
+
+            return value(*final_args, **final_kwargs)
+
+        return self._apply_op(flow_fn, *args, **kwargs.values(), new_type=object)
+
+    def _apply_op(self, fn, *args, new_type: Any = None):
+        args = [_safe_cast(arg, self._field_type) for arg in args]
+
+        if new_type is None:
+            new_type = self._field_type
+
+        return FieldReference(self, field_type=new_type, op=_Op(fn, args))
+
+    def get(self):
+        if self._required and self._value is None:
+            raise ValueError("required field is not set")
+
+        value = _get_computed_value(self._value)
+
+        for op in self._ops:
+            args = [_get_computed_value(arg) for arg in op.args]
+            value = op.fn(value, *args)
+            value = _get_computed_value(value)
+
+        return value
+
+    def __add__(self, other):
+        return self._apply_op(operator.add, other)
+
+    def __radd__(self, other):
+        radd = functools.partial(operator.add, other)
+
+        return self._apply_op(radd)
+
+    def __sub__(self, other):
+        return self._apply_op(operator.sub, other)
+
+    def __rsub__(self, other):
+        rsub = functools.partial(operator.sub, other)
+
+        return self._apply_op(rsub)
+
+    def __mul__(self, other):
+        return self._apply_op(operator.mul, other)
+
+    def __rmul__(self, other):
+        rmul = functools.partial(operator.mul, other)
+
+        return self._apply_op(rmul)
+
+    def __div__(self, other):
+        return self._apply_op(operator.truediv, other)
+
+    def __rdiv__(self, other):
+        rdiv = functools.partial(operator.truediv, other)
+
+        return self._apply_op(rdiv)
+
+    def __truediv__(self, other):
+        return self._apply_op(operator.truediv, other)
+
+    def __rtruediv__(self, other):
+        rtruediv = functools.partial(operator.truediv, other)
+
+        return self._apply_op(rtruediv)
+
+    def __floordiv__(self, other):
+        return self._apply_op(operator.floordiv, other)
+
+    def __rfloordiv__(self, other):
+        rfloordiv = functools.partial(operator.floordiv, other)
+
+        return self._apply_op(rfloordiv)
+
+    def __pow__(self, other):
+        return self._apply_op(operator.pow, other)
+
+    def __mod__(self, other):
+        return self._apply_op(operator.mod, other)
+
+    def __and__(self, other):
+        return self._apply_op(operator.and_, other)
+
+    def __or__(self, other):
+        return self._apply_op(operator.or_, other)
+
+    def __xor__(self, other):
+        return self._apply_op(operator.xor, other)
+
+    def __neg__(self):
+        return self._apply_op(operator.neg)
+
+    def __abs__(self):
+        return self._apply_op(operator.abs)
+
+    def to_int(self):
+        return self._apply_op(int)
+
+    def to_float(self):
+        return self._apply_op(float)
+
+    def to_str(self):
+        return self._apply_op(str)
 
 
 class Field(dict):
@@ -126,6 +429,8 @@ class Field(dict):
     def to_dict(self):
         return unfold_field(self)
 
+    ref = property(FieldReference)
+
 
 field = Field
 
@@ -158,6 +463,9 @@ def get_signature(obj):
 class NodeDict(Field):
     @classmethod
     def build(cls, __key, __name, obj, args, kwargs):
+        if isinstance(obj, NodeDictProxyObject):
+            obj = obj.target
+
         signature = get_signature(obj)
         signature_dict = {}
         for name, param in signature.parameters.items():
@@ -326,15 +634,22 @@ class NodeDictProxyObject(dict):
 
     def __call__(self, *args, **kwargs):
         if self.target is not None:
-            return NodeDict.build(INIT_KEY, self.qualname, self.target, args, kwargs)
+            node = NodeDict.build(INIT_KEY, self.qualname, self.target, args, kwargs)
 
-        return NodeDict(
-            {
-                INIT_KEY: self.qualname,
-                ARGS_KEY: list(args),
-                **kwargs,
-            }
-        )
+        else:
+            node = NodeDict(
+                {
+                    INIT_KEY: self.qualname,
+                    ARGS_KEY: list(args),
+                    **kwargs,
+                }
+            )
+
+        key = f"{self.qualname}#{SingleCounter.counter}"
+        SingleCounter.increase()
+        node["__key"] = key
+
+        return node
 
     def __bool__(self):
         return True
