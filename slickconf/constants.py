@@ -1,5 +1,6 @@
 INIT_KEY = "__init"
 FN_KEY = "__fn"
+LAZY_KEY = "__lazy"
 TARGET_KEY = "__target"
 VALIDATE_KEY = "__validate"
 PARTIAL_KEY = "__partial"
@@ -16,6 +17,7 @@ EXCLUDE_KEYS = {
     INIT_KEY,
     TARGET_KEY,
     FN_KEY,
+    LAZY_KEY,
     VALIDATE_KEY,
     PARTIAL_KEY,
     ARGS_KEY,

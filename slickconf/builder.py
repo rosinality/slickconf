@@ -417,6 +417,79 @@ class EagerCall:
         return EagerCallContainer(obj)
 
 
+class LazyEvalContainer:
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, *args, **kwargs):
+        if isinstance(self.fn, NodeDictProxyObject):
+            result = NodeDict.build(LAZY_KEY, self.fn.target, self.fn, args, kwargs)
+
+        else:
+            result = NodeDict.build(LAZY_KEY, self.fn, self.fn, args, kwargs)
+
+        return result
+
+
+class LazyEval:
+    def __getitem__(self, obj):
+        return LazyEvalContainer(obj)
+
+
+class ExternalContainer:
+    def __init__(self, obj, name, meta):
+        self.obj = obj
+        self.name = name
+        self.meta = meta
+
+    def build_obj(self, fn=False, key=None, *args, **kwargs):
+        init_obj = Init(self.obj, self.name, fn=fn, key=key)(*args, **kwargs)
+        init_obj["__meta"] = self.meta
+
+        return init_obj
+
+    def __call__(self, *args, **kwargs):
+        key = f"{self.name}#{SingleCounter.counter}"
+        SingleCounter.increase()
+
+        return self.build_obj(fn=False, key=key, *args, **kwargs)
+
+    def fn_call(self, *args, **kwargs):
+        return self.build_obj(fn=True, *args, **kwargs)
+
+
+class External:
+    def __getitem__(self, obj):
+        filepath = None
+        qualname = None
+
+        name = obj
+        if not isinstance(obj, str):
+            if isinstance(obj, NodeDictProxyObject):
+                name = obj[FN_KEY]
+                obj = obj.target
+
+            filepath = get_object_file(obj)
+            qualname = obj.__qualname__
+            name = import_to_str(obj)
+
+        if CLOSURE_WRAPPER_ID in name:
+            prefix = f"{CLOSURE_WRAPPER_ID}.<locals>."
+            name = name.replace(prefix, "")
+            qualname = qualname.replace(prefix, "")
+
+        meta = {}
+
+        if filepath is not None:
+            meta = {
+                "filepath": filepath,
+                "qualname": qualname,
+                "import_pyfile": True,
+            }
+
+        return ExternalContainer(obj, name, meta)
+
+
 class LazyCall:
     def __getitem__(self, obj):
         fn = False
