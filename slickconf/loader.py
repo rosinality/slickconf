@@ -2,7 +2,8 @@ import argparse
 import ast
 import copy
 import collections
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
+from gettext import install
 import json
 import os
 import re
@@ -18,8 +19,8 @@ except ImportError:
 
 from pydantic import BaseModel
 
-from slickconf.config import Config
-from slickconf.container import Field, NodeDict, SingleCounter
+from slickconf.config import Config, resolve_lazy
+from slickconf.container import Field, NodeDict, SingleCounter, FieldReference
 from slickconf.constants import KEY_KEY
 from slickconf.evaluate import evaluate
 from slickconf.tree import traverse, tree_map
@@ -235,6 +236,13 @@ def load_task_config(config: str, task: str, overrides: tuple = ()):
     return task_conf
 
 
+def resolve_fieldreference(target):
+    if isinstance(target, FieldReference):
+        return target.get()
+
+    return target
+
+
 def load_config(
     config: str,
     config_model: Config | None = None,
@@ -261,6 +269,8 @@ def load_config(
     - The loaded and validated configuration as an instance of the specified `config_model` or a AnyConfig
       object if no model was specified.
     """
+    config = str(config)
+
     conf = read_config(config, config_name=config_name)
 
     if overrides_file is not None:
@@ -268,6 +278,11 @@ def load_config(
         conf = merge_dict(conf, overrides_file["overrides"])
 
     conf = apply_overrides(conf, overrides)
+
+    conf = tree_map(resolve_fieldreference, conf)
+    conf = resolve_lazy(conf)
+
+    conf = conf.to_dict()
 
     if config_model is None:
         return NodeDict._recursive_init_(conf)
