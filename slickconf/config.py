@@ -6,7 +6,6 @@ from copy import deepcopy
 import sys
 import typing
 from typing import Any, Callable, Optional
-from typing_extensions import Annotated
 
 from pydantic import (
     BaseModel,
@@ -32,6 +31,7 @@ from slickconf.constants import (
     TARGET_KEY,
     INIT_KEY,
     FN_KEY,
+    LAZY_KEY,
     VALIDATE_KEY,
     PARTIAL_KEY,
     REPEAT_KEY,
@@ -73,14 +73,11 @@ class TaggableModel(BaseModel):
 
 
 class Config(BaseModel):
-    class Config:
-        extra = "forbid"
-        protected_namespaces = ()
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
 
 class MainConfig(BaseModel):
-    class Config:
-        extra = "forbid"
+    model_config = ConfigDict(extra="forbid")
 
     distributed: Optional[StrictBool] = None
     host: Optional[StrictStr] = None
@@ -88,6 +85,7 @@ class MainConfig(BaseModel):
     rank: Optional[StrictInt] = None
     local_rank: Optional[StrictInt] = None
     ckpt: Optional[StrictStr] = None
+    hparams: Optional[dict] = None
 
 
 def _check_type(type_name):
@@ -364,6 +362,9 @@ def _instance_traverse_validate(
             node[META_KEY]["qualname"], node[META_KEY]["filepath"]
         )
 
+    elif node.get(LAZY_KEY, None) is not None:
+        obj = node[LAZY_KEY]
+
     else:
         obj = resolve_module(target)
 
@@ -430,10 +431,12 @@ def _instance_traverse_validate(
         try:
             if len(exclude) > 0:
                 exclude = set(exclude)
-                model.validate({k: v for k, v in rest.items() if k not in exclude})
+                model.model_validate(
+                    {k: v for k, v in rest.items() if k not in exclude}
+                )
 
             else:
-                model.validate(rest)
+                model.model_validate(rest)
 
         except ValidationError as e:
             arbitrary_flag = True
@@ -494,6 +497,9 @@ def _instance_traverse_instantiate(
         obj = resolve_module_pyfile(
             node["__meta"]["qualname"], node["__meta"]["filepath"]
         )
+
+    elif node.get(LAZY_KEY, None) is not None:
+        obj = node[LAZY_KEY]
 
     else:
         obj = resolve_module(target)
@@ -582,7 +588,7 @@ def _instance_traverse_dict(
     root=True,
     singleton_dict=None,
 ):
-    if TARGET_KEY in node or INIT_KEY in node or FN_KEY in node:
+    if TARGET_KEY in node or INIT_KEY in node or FN_KEY in node or LAZY_KEY in node:
         if instantiate:
             return _instance_traverse_instantiate(
                 node,
@@ -781,3 +787,23 @@ def instantiate(instance, *args, _tags_: dict[str, Any] = None, **kwargs):
         _tags_=_tags_,
         singleton_dict=singleton_dict,
     )
+
+
+def resolve_lazy(node):
+    if isinstance(node, collections.abc.MutableSequence):
+        for i, elem in enumerate(node):
+            if hasattr(elem, "get") and elem.get(LAZY_KEY, None) is not None:
+                node[i] = instantiate(elem)
+
+            else:
+                resolve_lazy(elem)
+
+    elif isinstance(node, collections.abc.MutableMapping):
+        for key, value in list(node.items()):
+            if hasattr(value, "get") and value.get(LAZY_KEY, None) is not None:
+                node[key] = instantiate(value)
+
+            else:
+                resolve_lazy(value)
+
+    return node
