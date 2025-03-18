@@ -11,6 +11,9 @@ from slickconf.builder import (
     get_instance_attr,
     exempt,
     repeat,
+    external,
+    lazy,
+    partial,
 )
 from slickconf.container import Field, field, NodeDict
 from slickconf.config import Config, Instance, MainConfig, instantiate
