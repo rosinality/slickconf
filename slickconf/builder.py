@@ -5,7 +5,6 @@ import functools
 import importlib
 import os
 import inspect
-import linecache
 import textwrap
 import types
 import uuid
@@ -13,15 +12,14 @@ from contextlib import contextmanager
 from copy import deepcopy
 from typing import Tuple, Union
 
-import libcst as cst
-
 from slickconf.constants import (
     INIT_KEY,
     FN_KEY,
+    LAZY_KEY,
     ARGS_KEY,
     REPEAT_KEY,
 )
-from slickconf.container import Field, NodeDict, SingleCounter
+from slickconf.container import Field, NodeDict, SingleCounter, NodeDictProxyObject
 from slickconf.pyconfig import import_to_str
 
 CFG_PACKAGE_NAME = "slickconf._conf_loader"
@@ -61,6 +59,10 @@ def get_instance_attr(instance, attr):
     return getattr(instance, attr)
 
 
+def partial(fn, *args, **kwargs):
+    return F[fn](*args, **kwargs)
+
+
 def auto_config_call_handler(fn_or_cls: callable, *args, **kwargs):
     if (
         fn_or_cls
@@ -74,8 +76,11 @@ def auto_config_call_handler(fn_or_cls: callable, *args, **kwargs):
             copy.copy,
             copy.deepcopy,
             repeat,
+            partial,
         }
-        or isinstance(fn_or_cls, EagerCallContainer)
+        or isinstance(
+            fn_or_cls, (EagerCallContainer, ExternalContainer, LazyEvalContainer)
+        )
         or inspect.isbuiltin(fn_or_cls)
         or (inspect.isclass(fn_or_cls) and fn_or_cls.__module__ == "builtins")
         or getattr(fn_or_cls, "__exempt__", False)
@@ -238,7 +243,9 @@ def config_fn(fn):
     line_number = fn.__code__.co_firstlineno
 
     if _is_lambda(fn):
-        source = _getsource_for_lambda(fn)
+        from slickconf.lambda_finder import getsource_for_lambda
+
+        source = getsource_for_lambda(fn)
 
     else:
         source = textwrap.dedent(inspect.getsource(fn))
@@ -335,13 +342,24 @@ def tag(tag_name, default=NO_VALUE):
     return Field({"__tag": tag_name, "default": default})
 
 
+def get_object_file(obj):
+    if hasattr(obj, "__code__"):
+        return obj.__code__.co_filename
+
+    for attr in obj.__dict__.values():
+        if callable(attr) and hasattr(attr, "__code__"):
+            return attr.__code__.co_filename
+
+    raise ValueError("No __code__ attribute found in object to determine file path")
+
+
 def function(obj, *args, **kwargs):
     filepath = None
     qualname = None
 
     name = obj
     if not isinstance(obj, str):
-        filepath = obj.__code__.co_filename
+        filepath = get_object_file(obj)
         qualname = obj.__qualname__
         name = import_to_str(obj)
 
@@ -506,11 +524,133 @@ class LazyCall:
 
 class LazyFn:
     def __getitem__(self, obj):
+        if isinstance(obj, ExternalContainer):
+            return obj.fn_call
+
         name = obj
         if not isinstance(obj, str):
-            name = import_to_str(obj)
+            if isinstance(obj, NodeDictProxyObject):
+                name = obj[FN_KEY]
+                obj = obj.target
+
+            else:
+                name = import_to_str(obj)
 
         return Init(obj, name, True)
+
+
+class ImportsContextUsageFinder(ast.NodeVisitor):
+    def __init__(self, source, library_root=None, qualname_targets=None):
+        # Set either library_root="yourlib" or qualname_targets={"yourlib.imports"}.
+        self.source = source
+        self.library_root = library_root
+        self.qualname_targets = set(qualname_targets or ())
+        self.aliases = {}  # local name -> fully qualified module/symbol (best effort)
+        self.occurrences = []
+
+    # Record import aliases so we can resolve names/attributes later
+    def visit_Import(self, node):
+        for alias in node.names:
+            # import pkg.sub as ps -> ps -> pkg.sub
+            # import pkg.sub        -> binds "pkg" in the namespace
+            bind_name = alias.asname or alias.name.split(".")[0]
+            # Map to the thing imported; for bare "import pkg.sub", the bound name is "pkg".
+            # Mapping it to alias.name is still useful to know the top-level "pkg".
+            self.aliases[bind_name] = alias.name
+
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        module = node.module  # can be None for relative imports
+        level = node.level or 0
+        for alias in node.names:
+            asname = alias.asname or alias.name
+            if module and level == 0:
+                fq = f"{module}.{alias.name}"
+            else:
+                # Relative imports or unknown module; keep a best-effort string
+                dots = "." * level
+                if module:
+                    fq = f"{dots}{module}.{alias.name}"
+                else:
+                    fq = f"{dots}{alias.name}"
+            self.aliases[asname] = fq
+        self.generic_visit(node)
+
+    def visit_With(self, node):
+        self._check_withlike(node)
+        self.generic_visit(node)
+
+    def visit_AsyncWith(self, node):
+        self._check_withlike(node)
+        self.generic_visit(node)
+
+    def _check_withlike(self, node):
+        for item in node.items:
+            expr = item.context_expr
+            if isinstance(expr, ast.Call):
+                fqn = self._resolve_fqn(expr.func)
+                if self._matches_target(fqn):
+                    self.occurrences.append(
+                        {
+                            "line": expr.lineno,
+                            "col": expr.col_offset,
+                            "resolved": fqn,
+                            "snippet": ast.get_source_segment(self.source, expr) or "",
+                        }
+                    )
+
+    def _resolve_fqn(self, func_node):
+        # Turn Name/Attribute chain into a dotted string and resolve first name via aliases.
+        chain = self._name_chain(func_node)
+        if not chain:
+            return None
+        head = chain[0]
+        head_resolved = self.aliases.get(head, head)
+        if len(chain) == 1:
+            return head_resolved
+        return ".".join([head_resolved] + chain[1:])
+
+    def _name_chain(self, node):
+        # Returns a list representing a dotted path, e.g. m.your.attr -> ["m", "your", "attr"]
+        if isinstance(node, ast.Name):
+            return [node.id]
+        if isinstance(node, ast.Attribute):
+            base = self._name_chain(node.value)
+            if base:
+                return base + [node.attr]
+        return None
+
+    def _matches_target(self, fqn):
+        if not fqn:
+            return False
+        # Exact match(s), if provided (e.g., {"yourlib.imports"})
+        if self.qualname_targets:
+            return fqn in self.qualname_targets
+
+        # Library-root match: same root module and final name is "imports"
+        if self.library_root:
+            parts = fqn.split(".")
+            if (
+                len(parts) >= 2
+                and parts[0] == self.library_root
+                and parts[-1] == "imports"
+            ):
+                return True
+            return False
+
+        # Fallback: any call whose last part is "imports" (may have false positives)
+        return fqn.split(".")[-1] == "imports"
+
+
+def find_imports_context_uses(source, library_root=None, qualname_targets=None):
+    tree = ast.parse(source)
+    finder = ImportsContextUsageFinder(
+        source, library_root=library_root, qualname_targets=qualname_targets
+    )
+    finder.visit(tree)
+
+    return len(finder.occurrences) > 0
 
 
 @contextmanager
@@ -568,10 +708,19 @@ def patch_import():
             with open(cur_file) as f:
                 content = f.read()
 
-            # exec(compile(content, cur_file, "exec"), module.__dict__)
-            module.__dict__[CALL_HANDLER_ID] = auto_config_call_handler
-            module.__dict__[EXEMPT_DECORATOR_ID] = auto_config_exempt_decorator
-            exec(auto_config_from_source(content, cur_file), module.__dict__)
+            if find_imports_context_uses(
+                content, qualname_targets={"slickconf.imports"}
+            ):
+                # Compile first with filename to:
+                # 1. make filename appears in stacktrace
+                # 2. make load_rel able to find its parent's (possibly remote) location
+                exec(compile(content, cur_file, "exec"), module.__dict__)
+
+            else:
+                module.__dict__[CALL_HANDLER_ID] = auto_config_call_handler
+                module.__dict__[EXEMPT_DECORATOR_ID] = auto_config_exempt_decorator
+
+                exec(auto_config_from_source(content, cur_file), module.__dict__)
 
             # for name in fromlist:  # turn imported dict into DictConfig automatically
             #     val = _cast_to_config(module.__dict__[name])
@@ -619,7 +768,9 @@ class PyConfig:
                 with open(filename) as f:
                     content = f.read()
 
-                if content.strip().startswith('"use legacy"'):
+                if find_imports_context_uses(
+                    content, qualname_targets={"slickconf.imports"}
+                ):
                     # Compile first with filename to:
                     # 1. make filename appears in stacktrace
                     # 2. make load_rel able to find its parent's (possibly remote) location
@@ -638,7 +789,7 @@ class PyConfig:
         if callable(ret):
             ret = ret()
 
-        ret = ret.to_dict()
+        # ret = ret.to_dict()
 
         if has_keys:
             return tuple(ret[a] for a in keys)
@@ -650,3 +801,5 @@ L = LazyCall()
 F = LazyFn()
 single = Single()
 call = EagerCall()
+external = External()
+lazy = LazyEval()
