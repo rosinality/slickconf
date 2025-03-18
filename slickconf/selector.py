@@ -1,8 +1,8 @@
 import collections
 import contextlib
-from typing import Any, Collection
+from typing import Collection
 
-from slickconf.builder import config_fn, import_to_str, exempt, call
+from slickconf.builder import config_fn, import_to_str, exempt
 from slickconf.constants import INIT_KEY, FN_KEY, TARGET_KEY, TAG_KEY
 from slickconf import tree as tree_fn
 

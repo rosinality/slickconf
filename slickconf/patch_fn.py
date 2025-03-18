@@ -1,4 +1,3 @@
-import re
 from slickconf.builder import exempt, import_to_str
 from slickconf.container import NodeDict
 from slickconf.constants import SIGNATURE_KEY, ARGS_KEY, INIT_KEY
